@@ -1,0 +1,29 @@
+{
+    "offset": {
+        "x": -160,
+        "y": 0,
+        "z": 120
+    },
+    "devices": [
+        {
+            "name": "Sensor 1",
+            "type": "lecture",
+            "floor": 0,
+            "position": {
+                "x": 0,
+                "y": 0,
+                "z": 0
+            }
+        },
+        {
+            "name": "Sensor 2",
+            "type": "office",
+            "floor": 1,
+            "position": {
+                "x": 0,
+                "y": 10,
+                "z": 0
+            }
+        }
+    ]
+}

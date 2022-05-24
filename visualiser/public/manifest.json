@@ -1,0 +1,8 @@
+{
+  "short_name": "Abacws Data Vis",
+  "name": "Abacws building IoT data visualiser",
+  "start_url": ".",
+  "display": "standalone",
+  "theme_color": "#000000",
+  "background_color": "#0a0a0a"
+}

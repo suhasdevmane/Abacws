@@ -1,0 +1,35 @@
+version: '3.8'
+services:
+  mongo:
+    image: mongo
+    container_name: abacws-mongo
+    restart: always
+    volumes:
+      - ./mongo:/data/db
+
+  api:
+    image: ghcr.io/randomman552/abacws-data-vis:api-latest
+    container_name: abacws-api
+    restart: always
+    depends_on:
+      - mongo
+    volumes:
+      - ./api/src/api/data:/api/api/data
+
+  visualiser:
+    image: ghcr.io/randomman552/abacws-data-vis:visualiser-latest
+    container_name: abacws-visualiser
+    restart: always
+    depends_on:
+      - api
+    # ports:          #enable this for local run port 8080
+    #   - 80:80
+    # Traefik is recommended, you can set up a NGINX or Apache proxy instead, but traefik is much easier.
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.services.abacws-visualiser.loadbalancer.server.port=80"
+      - "traefik.http.routers.abacws-visualiser.rule=Host(`visualiser.abacws.example.com`)"
+      - "traefik.http.routers.abacws-visualiser.entrypoints=https"
+      - "traefik.http.routers.abacws-visualiser.tls=true"
+
+  
