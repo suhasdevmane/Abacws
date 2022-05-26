@@ -8,7 +8,7 @@ services:
       - ./mongo:/data/db
 
   api:
-    image: ghcr.io/suhasdevmane/Abacws:api-latest
+    image: ghcr.io/suhasdevmane/abacws:api-latest
     container_name: abacws-api
     restart: always
     depends_on:
@@ -17,7 +17,7 @@ services:
       - ./api/src/api/data:/api/api/data
 
   visualiser:
-    image: ghcr.io/suhasdevmane/Abacws:visualiser-latest
+    image: ghcr.io/suhasdevmane/abacws:visualiser-latest
     container_name: abacws-visualiser
     restart: always
     depends_on:
