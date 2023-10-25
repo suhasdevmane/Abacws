@@ -1,12 +1,12 @@
 # Build layer
-FROM node:current-alpine AS node
+FROM node:16 AS node
 
 COPY . /app
 WORKDIR /app
 RUN npm i
 RUN npm run build
 # Remove non-production node modules after build
-# RUN rm -rf node_modules
+RUN rm -rf node_modules
 RUN npm i --only=prod
 
 # Application layer
