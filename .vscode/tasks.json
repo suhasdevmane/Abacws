@@ -1,0 +1,40 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "docker-compose up (pwsh)",
+			"type": "shell",
+			"command": "docker compose up --build",
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "docker compose up --build",
+			"type": "shell",
+			"command": "docker compose",
+			"args": [
+				"up",
+				"--build"
+			],
+			"isBackground": false,
+			"problemMatcher": [
+				"$eslint-stylish"
+			],
+			"group": "build"
+		},
+		{
+			"label": "docker-compose up --build",
+			"type": "shell",
+			"command": "docker-compose",
+			"args": [
+				"up",
+				"--build"
+			],
+			"isBackground": false,
+			"problemMatcher": [
+				"$eslint-stylish"
+			],
+			"group": "build"
+		}
+	]
+}

@@ -1,29 +1,46 @@
-version: '3.8'
 services:
   mongo:
     image: mongo
     container_name: abacws-mongo
     restart: always
     volumes:
-      - ./mongo:/data/db
+      - mongo-data:/data/db
 
   api:
-    image: ghcr.io/suhasdevmane/abacws:api-latest
+    # image: ghcr.io/suhasdevmane/abacws:api-latest
+    build:
+      context: api
+      dockerfile: Dockerfile
     container_name: abacws-api
+    hostname: apihost
+    environment:
+      - API_PORT=5000
     restart: always
     depends_on:
       - mongo
+    ports:
+      - "5000:5000"
     volumes:
-      - ./api/src/api/data:/api/api/data
+      - ./api/src/api/data:/api/src/api/data
+    healthcheck:
+      test: ["CMD", "sh", "-lc", "wget -qO- http://localhost:5000/health | grep -q 'ok'"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+
 
   visualiser:
-    image: ghcr.io/suhasdevmane/abacws:visualiser-latest
+    # image: ghcr.io/suhasdevmane/abacws:visualiser-latest
+    build:
+      context: visualiser
+      dockerfile: Dockerfile
     container_name: abacws-visualiser
+    hostname: visualiserhost
     restart: always
     depends_on:
       - api
-    # ports:          #enable this for local run port 8080
-    #   - 80:80
+    ports:          #enable this for local run port 8080
+      - 8090:80
     # Traefik is recommended, you can set up a NGINX or Apache proxy instead, but traefik is much easier.
     labels:
       - "traefik.enable=true"
@@ -31,5 +48,12 @@ services:
       - "traefik.http.routers.abacws-visualiser.rule=Host(`visualiser.abacws.example.com`)"
       - "traefik.http.routers.abacws-visualiser.entrypoints=https"
       - "traefik.http.routers.abacws-visualiser.tls=true"
+    healthcheck:
+      test: ["CMD", "sh", "-lc", "wget -qO- http://localhost/health | grep -q 'ok'"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
 
+volumes:
+  mongo-data:
   
