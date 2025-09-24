@@ -4,7 +4,6 @@ import { OrbitControls } from "three/examples/jsm/controls/OrbitControls";
 import { TransformControls } from "three/examples/jsm/controls/TransformControls";
 import { CSS2DRenderer, CSS2DObject } from "three/examples/jsm/renderers/CSS2DRenderer";
 import Stats from "three/examples/jsm/libs/stats.module";
-import React from "react";
 import { DeviceSelectEvent, FloorSelectEvent, LoadEvent } from "./events";
 import { apiFetch } from "../api";
 
@@ -19,14 +18,29 @@ let LAYERS = [
   "egg.glb",
 ];
 
-// Fancy circle-like device: small torus ring
-const DEVICE_GEOM = new THREE.TorusGeometry(1.2, 0.2, 12, 24);
+// Coordinate space / legacy offset handling -------------------------------------------------------
+// Legacy devices were authored in a coordinate space offset by (-160, 0, 120) relative to the model.
+// We apply a group offset only if coordinates have NOT yet been normalized server-side, *or* if the
+// new FORCE_LEGACY_OFFSET flag is enabled. This lets you force old placement when reviewing historic
+// data or if you prefer the previous spatial reference frame.
+// Flags (in order of precedence):
+//   window.__ABACWS_FORCE_LEGACY_OFFSET__  (boolean)
+//   import.meta.env.VITE_FORCE_LEGACY_OFFSET === 'true'
+//   Auto heuristic (>=50% devices appear in legacy quadrant) when NOT normalized
+// Normalization flag sources:
+//   window.__ABACWS_COORDS_NORMALIZED__
+//   import.meta.env.VITE_COORDS_NORMALIZED === 'true'
+const COORDS_NORMALIZED = (window && window.__ABACWS_COORDS_NORMALIZED__) || (import.meta?.env?.VITE_COORDS_NORMALIZED === 'true');
+const FORCE_LEGACY_OFFSET = (window && window.__ABACWS_FORCE_LEGACY_OFFSET__) || (import.meta?.env?.VITE_FORCE_LEGACY_OFFSET === 'true');
+const LEGACY_GROUP_OFFSET = new THREE.Vector3(160, 0, -120);
+// Auto alignment flag (align device cloud to model coordinate frame)
+const AUTO_ALIGN = (window && window.__ABACWS_AUTO_ALIGN__) || (import.meta?.env?.VITE_AUTO_ALIGN_DEVICES === 'true');
+
+// Device marker geometry: solid sphere (larger click target, clearer visual)
+const DEVICE_GEOM = new THREE.SphereGeometry(1.4, 24, 24);
 const DEVICE_COLOR = 0xff5555;
 const DEVICE_HOVER_COLOR = 0x00aaff;
 const DEVICE_SELECTED_COLOR = 0x00ffaa;
-const DEVICE_COLOR_HEX = '#ff5555';
-const DEVICE_HOVER_COLOR_HEX = '#00aaff';
-const DEVICE_SELECTED_COLOR_HEX = '#00ffaa';
 
 // Inline SVGs as textures for sprites (white base; tint via material.color)
 const DEVICE_ICON_SVG = `
@@ -87,8 +101,8 @@ export default class Graphics {
   deselectDevice() {
     const prev = this._selectedDevice;
     if (!prev) return;
-    // Reset icon color
-    if (prev.userData?.deviceIconSprite) prev.userData.deviceIconSprite.material.color.set(DEVICE_COLOR);
+    // Reset marker color
+    if (prev.material?.color) prev.material.color.set(DEVICE_COLOR);
     this._selectedDevice = undefined;
     // Detach transform and close HUD
     try { this.transform.detach(); } catch (_) {}
@@ -102,6 +116,7 @@ export default class Graphics {
   camera = new THREE.PerspectiveCamera();
   scene = new THREE.Scene();
   deviceScene = new THREE.Scene();
+  deviceRoot = new THREE.Group();
   renderer = new THREE.WebGLRenderer({ powerPreference: "high-performance" });
   labelRenderer = new CSS2DRenderer();
   rayCaster = new THREE.Raycaster();
@@ -126,6 +141,12 @@ export default class Graphics {
   _lockAfterMove = false; // Auto pin after finishing a move
   _saveTimer = undefined; // Timer for throttled save during transform
   _selectionHud = undefined; // { obj: CSS2DObject, el: HTMLElement, mesh }
+  // Axes / grid helpers & state
+  axesHelper = undefined;
+  gridHelper = undefined;
+  _axesLabels = [];
+  _axesVisible = true; // show axes by default
+  _gridVisible = false; // grid off by default (can be toggled with 'g')
 
   constructor() {
     this.width = window.innerWidth;
@@ -133,7 +154,9 @@ export default class Graphics {
     this.camera.aspect = this.width / this.height;
     this.camera.updateProjectionMatrix();
     this.renderer.autoClear = false;
-    this.renderer.setPixelRatio(2);
+    // Adaptive pixel ratio: cap to 1.5 to reduce GPU/parse cost on high DPI screens
+    const desiredPR = Math.min(window.devicePixelRatio || 1, 1.5);
+    this.renderer.setPixelRatio(desiredPR);
     this.renderer.setSize(this.width, this.height);
     this.renderer.setClearColor(0x000000);
   this.labelRenderer.setSize(this.width, this.height);
@@ -170,6 +193,21 @@ export default class Graphics {
       const obj = this.transform.object;
       if (obj) this._dragOrig = obj.position.clone();
     });
+    // Listen for external focus requests from UI list
+    this._focusListener = (e) => {
+      try {
+        const name = e?.detail?.name;
+        if (!name) return;
+        this.focusDeviceByName(name);
+      } catch(_){/* ignore */}
+    };
+    window.addEventListener('focus-device', this._focusListener);
+    // Debug bbox toggle
+    this._bboxToggleListener = (e) => {
+      const enabled = !!e.detail?.enabled;
+      this.toggleBoundingBoxes(enabled);
+    };
+    window.addEventListener('abacws:toggle-bboxes', this._bboxToggleListener);
   }
 
   static getInstance() {
@@ -181,11 +219,11 @@ export default class Graphics {
 
   async init(mountRef) {
     this.ref = mountRef.current;
-  this.ref.appendChild(this.stats.dom);
   this.ref.appendChild(this.renderer.domElement);
   this.ref.appendChild(this.labelRenderer.domElement);
-  // TransformControls should live in the same scene as devices
-  this.deviceScene.add(this.transform);
+  // Add root container (deviceRoot) and transform controls
+    this.deviceScene.add(this.deviceRoot);
+    this.deviceScene.add(this.transform);
     window.addEventListener('resize', this.onReize);
     window.addEventListener('pointermove', this.onPointerMove);
     window.addEventListener('pointerdown', this.onPointerDown);
@@ -212,6 +250,10 @@ export default class Graphics {
       const devices = (await apiFetch("/api/devices")).body;
       this.setDevices(devices);
     } catch {}
+    // Kick off periodic latest mapping poll for color scaling
+    this.startLatestPolling();
+    // Axes + grid helpers (orientation aids)
+    this.createOrientationHelpers();
     const groundGeom = new THREE.PlaneBufferGeometry(300, 300, 8, 8);
     const groundMat = new THREE.MeshBasicMaterial({ color: 0x3f3f3f, side: THREE.DoubleSide });
   const groundPlane = new THREE.Mesh(groundGeom, groundMat);
@@ -219,21 +261,131 @@ export default class Graphics {
   groundPlane.position.set(160, 0.5, -120);
   this.ground = groundPlane;
   this.scene.add(groundPlane);
+    // Display lightweight progress overlay while loading models
+    this.showProgressOverlay();
     const loader = new GLTFLoader();
-    const loadLayer = async (fileName) => {
-      const layer = await loader.loadAsync(`/assets/${fileName}`);
-      this.scene.add(layer.scene);
-    };
-    for (const layerName of LAYERS) {
+    const tasks = LAYERS.map(fileName => (async () => {
+      const url = `/assets/${fileName}`;
       try {
-        await loadLayer(layerName);
-      } catch (e) {
-        // Log failures so blank scenes are diagnosable (e.g., LFS pointer files instead of real GLBs)
-        // eslint-disable-next-line no-console
-        console.warn(`[Graphics] Failed to load layer "${layerName}"`, e);
+        const layer = await loader.loadAsync(url);
+        this.scene.add(layer.scene);
+        this._loadedLayers = (this._loadedLayers || 0) + 1;
+        this.updateProgressOverlay();
+        if (window.__ABACWS_DEBUG) console.log(`[Graphics] Loaded layer: ${fileName}`);
+      } catch(e) {
+        this._failedLayers = (this._failedLayers || 0) + 1;
+        this.updateProgressOverlay();
+        console.warn(`[Graphics] Failed to load layer "${fileName}" from ${url}`, e);
       }
+    })());
+    await Promise.all(tasks);
+    this.removeProgressOverlay();
+
+    // Post-load diagnostics overlay if nothing rendered
+    if (!this._loadedLayers) {
+      this.showDiagnosticsOverlay();
     }
+  // Attach stats panel only after heavy load completes (reposition top-right to avoid UI overlap)
+  this.stats.dom.style.position = 'fixed';
+  this.stats.dom.style.top = '6px';
+  this.stats.dom.style.right = '6px';
+  this.stats.dom.style.left = 'auto';
+  this.stats.dom.style.zIndex = '150';
+  this.stats.dom.style.pointerEvents = 'none';
+  this.ref.appendChild(this.stats.dom);
     window.dispatchEvent(new LoadEvent());
+  }
+
+  showProgressOverlay() {
+    if (this._progressEl) return;
+    const el = document.createElement('div');
+    el.style.cssText='position:fixed;top:8px;right:8px;z-index:9998;background:rgba(0,0,0,.55);color:#fff;padding:6px 10px;font:12px system-ui;border-radius:6px;backdrop-filter:blur(4px)';
+    el.textContent='Loading 3D…';
+    document.body.appendChild(el);
+    this._progressEl = el;
+  }
+  updateProgressOverlay() {
+    if(!this._progressEl) return;
+    const total = (Array.isArray(LAYERS)? LAYERS.length : 0);
+    const ok = this._loadedLayers || 0;
+    const fail = this._failedLayers || 0;
+    this._progressEl.textContent = `Loading 3D… ${ok}/${total}${fail?` (failed ${fail})`:''}`;
+  }
+  removeProgressOverlay() { try { if(this._progressEl){ this._progressEl.remove(); this._progressEl=undefined; } } catch(_){} }
+
+  showDiagnosticsOverlay() {
+    if (this._diagShown) return;
+    this._diagShown = true;
+    try {
+      const el = document.createElement('div');
+      el.style.cssText = 'position:fixed;top:12px;left:12px;z-index:9999;padding:10px 14px;background:#7f1d1d;color:#fff;font:12px/1.4 system-ui;border-radius:8px;max-width:320px;box-shadow:0 4px 14px rgba(0,0,0,.4);';
+      const tried = Array.isArray(LAYERS) ? LAYERS.length : 0;
+      const failed = this._failedLayers || 0;
+      el.innerHTML = `<strong>3D Model Not Loaded</strong><br/>Loaded: 0 | Failed: ${failed} | Expected: ${tried}<br/>Check that <code>visualiser/public/assets/*.glb</code> exist in the image and are not Git LFS pointer files.<br/><br/><em>Enable verbose logging:</em> <code>localStorage.setItem('__abacws_debug','1'); location.reload();</code>`;
+      document.body.appendChild(el);
+      if (typeof localStorage !== 'undefined') {
+        if (localStorage.getItem('__abacws_debug')) window.__ABACWS_DEBUG = true;
+      }
+    } catch (_) { /* ignore overlay failures */ }
+  }
+
+  // Poll /api/latest periodically and update device colors along a gradient
+  startLatestPolling() {
+    const intervalMs = 15000;
+    const fetchLatest = async () => {
+      try {
+        const res = await apiFetch('/api/latest');
+        if(!res.ok) return;
+        const data = res.body || {};
+        this.applyLatestColoring(data);
+      } catch(_){}
+    };
+    fetchLatest();
+    this._latestTimer = setInterval(fetchLatest, intervalMs);
+  }
+
+  stopLatestPolling() { if(this._latestTimer) clearInterval(this._latestTimer); }
+
+  // Map primary values to a color gradient (cool -> hot)
+  applyLatestColoring(latest) {
+    if(!latest || typeof latest !== 'object') return;
+    // Helper: parse hex string (#rrggbb) to int
+    const parseHex = (h) => {
+      if(typeof h !== 'string') return null;
+      const m = h.trim().match(/^#?([0-9a-fA-F]{6})$/);
+      if(!m) return null;
+      return parseInt(m[1], 16);
+    };
+    const lerpColor = (c1, c2, t) => {
+      const r1 = (c1 >> 16) & 0xff, g1 = (c1 >> 8) & 0xff, b1 = c1 & 0xff;
+      const r2 = (c2 >> 16) & 0xff, g2 = (c2 >> 8) & 0xff, b2 = c2 & 0xff;
+      const r = Math.round(r1 + (r2 - r1) * t);
+      const g = Math.round(g1 + (g2 - g1) * t);
+      const b = Math.round(b1 + (b2 - b1) * t);
+      return (r << 16) | (g << 8) | b;
+    };
+    for(const child of this.deviceRoot.children) {
+      if(!(child instanceof THREE.Mesh) || !child.userData?.name) continue;
+      const name = child.userData.name;
+      const entry = latest[name];
+      if(!entry || typeof entry.primary !== 'number') continue;
+      // Mapping-specific range & colors (these fields piggyback via /latest if added server side)
+      const minVal = (entry.range_min !== undefined && entry.range_min !== null) ? Number(entry.range_min) : undefined;
+      const maxVal = (entry.range_max !== undefined && entry.range_max !== null) ? Number(entry.range_max) : undefined;
+      const colMinHex = parseHex(entry.color_min) || 0x1d4ed8;
+      const colMaxHex = parseHex(entry.color_max) || 0xef4444;
+      let norm;
+      if(minVal !== undefined && maxVal !== undefined && maxVal > minVal) {
+        norm = (entry.primary - minVal) / (maxVal - minVal);
+      } else {
+        // fallback dynamic single-value -> neutral
+        norm = 0.5; // Until backend sends global min/max or mapping range defined
+      }
+      norm = Math.min(Math.max(norm, 0), 1);
+      const col = lerpColor(colMinHex, colMaxHex, norm);
+      if(child === this._selectedDevice || child === this._hoveredDevice) continue;
+      if(child.material?.color) child.material.color.set(col);
+    }
   }
 
   animate() {
@@ -251,17 +403,14 @@ export default class Graphics {
   updateSpriteScales() {
     // Make icon/lock sprites scale with camera distance so they feel proportional to the model
     const camPos = this.camera.position;
-    for (const child of this.deviceScene.children) {
+    for (const child of this.deviceRoot.children) {
       if (!(child instanceof THREE.Mesh)) continue;
-      const device = child;
-      const icon = device.userData?.deviceIconSprite;
-      const lock = device.userData?.lockSprite;
-      if (!icon && !lock) continue;
-      const dist = camPos.distanceTo(device.position);
-      // Tune these numbers to taste: closer -> bigger up to max; farther -> smaller down to min
+      const lock = child.userData?.lockSprite;
+      if (!lock) continue;
+      const worldPos = child.getWorldPosition(new THREE.Vector3());
+      const dist = camPos.distanceTo(worldPos);
       const factor = THREE.MathUtils.clamp(120 / Math.max(1, dist), 0.6, 1.6);
-      if (icon) icon.scale.set(1.8 * factor, 2.2 * factor, 1);
-      if (lock) lock.scale.set(0.9 * factor, 0.9 * factor, 1);
+      lock.scale.set(0.9 * factor, 0.9 * factor, 1);
     }
   }
 
@@ -280,6 +429,8 @@ export default class Graphics {
     window.removeEventListener('keydown', this.onKeyDown);
   window.removeEventListener('keyup', this.onKeyUp);
     window.removeEventListener(FloorSelectEvent.TYPE, this.onFloorSelect);
+    if (this._focusListener) window.removeEventListener('focus-device', this._focusListener);
+    if (this._bboxToggleListener) window.removeEventListener('abacws:toggle-bboxes', this._bboxToggleListener);
     this.onAnimate = () => { this.animate(); };
     Graphics.instance = undefined;
   }
@@ -295,43 +446,188 @@ export default class Graphics {
   setDevices(devices) {
     if (!devices) return;
     if (this._selectionHud) this.closeSelectionHud();
-    this.deviceScene.clear();
+    // Clear previous devices but keep root transform & lighting
+    this.deviceRoot.clear();
     const geom = DEVICE_GEOM;
+    // Detect legacy coordinate dataset: majority negative X & positive Z
+  const legacyCount = devices.filter(d => d?.position && d.position.x < 0 && d.position.z > 0).length;
+  const heuristicLegacy = !COORDS_NORMALIZED && legacyCount > devices.length * 0.5;
+  const useLegacy = FORCE_LEGACY_OFFSET || heuristicLegacy;
+  this.deviceRoot.position.copy(useLegacy ? LEGACY_GROUP_OFFSET : new THREE.Vector3(0,0,0));
     for (const device of devices) {
-      // Invisible anchor mesh (no visible ring)
-      const mat = new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.0, depthWrite: false, depthTest: false });
-      const cube = new THREE.Mesh(geom, mat);
-      // Ensure torus lies flat on XZ plane (ring around Y axis)
-      cube.rotation.x = Math.PI / 2;
-      cube.position.set(device.position.x, device.position.y, device.position.z);
-      cube.userData = device;
-      // Prevent anchor geometry from receiving raycasts (we use a dedicated pick proxy)
-      cube.raycast = () => {};
-      // Visual cue when pinned previously used emissive on mesh; now handled by lock sprite color
-      this.deviceScene.add(cube);
-  // Attach in-scene icon/lock sprites and a larger invisible pick proxy for easier selection
-  this.attachDeviceIcon(cube);
-  this.attachLockSprite(cube);
-  this.updateLockSprite(cube);
-  this.attachPickProxy(cube);
+      const mat = new THREE.MeshStandardMaterial({
+        color: DEVICE_COLOR,
+        metalness: 0.05,
+        roughness: 0.45,
+        emissive: 0x111111,
+        emissiveIntensity: 0.25,
+      });
+      const sphere = new THREE.Mesh(geom, mat);
+      const { x, y, z } = device.position || { x:0, y:0, z:0 };
+      sphere.position.set(x, y, z); // raw position; group handles shift if needed
+      sphere.userData = device;
+      this.deviceRoot.add(sphere);
+      this.attachLockSprite(sphere);
+      this.updateLockSprite(sphere);
+      this.attachPickProxy(sphere);
     }
-    // Ensure TransformControls stays in device scene after clear()
-    this.deviceScene.add(this.transform);
-    const ambientLight = new THREE.AmbientLight(0x404040);
-    const light = new THREE.DirectionalLight(0xf4f4f4);
-    light.position.set(-100, 100, -100);
-    this.deviceScene.add(light, ambientLight);
+    // Perform automatic alignment if requested
+    if (AUTO_ALIGN && devices.length) {
+      try {
+        // Try cache first to avoid jitter across reloads unless devices changed count
+        const cacheKey = '__abacws_device_alignment_v1';
+        const cached = JSON.parse(localStorage.getItem(cacheKey) || 'null');
+        if (cached && typeof cached.dx === 'number' && cached.count === devices.length) {
+          this.deviceRoot.position.add(new THREE.Vector3(cached.dx, cached.dy, cached.dz));
+        } else {
+          // Compute device cloud bbox (raw positions)
+          const dMin = new THREE.Vector3(+Infinity, +Infinity, +Infinity);
+            const dMax = new THREE.Vector3(-Infinity, -Infinity, -Infinity);
+          for (const d of devices) {
+            if (!d.position) continue;
+            dMin.x = Math.min(dMin.x, d.position.x); dMax.x = Math.max(dMax.x, d.position.x);
+            dMin.y = Math.min(dMin.y, d.position.y); dMax.y = Math.max(dMax.y, d.position.y);
+            dMin.z = Math.min(dMin.z, d.position.z); dMax.z = Math.max(dMax.z, d.position.z);
+          }
+          // Compute model bbox using first floor mesh if available
+          let mMin, mMax;
+          if (this._layerGroups?.floors?.children?.length) {
+            const floor = this._layerGroups.floors.children[0];
+            floor.updateWorldMatrix(true, true);
+            const box = new THREE.Box3().setFromObject(floor);
+            mMin = box.min.clone(); mMax = box.max.clone();
+          }
+          if (mMin && mMax && dMin.x < Infinity) {
+            const dCenter = dMin.clone().add(dMax).multiplyScalar(0.5);
+            const mCenter = mMin.clone().add(mMax).multiplyScalar(0.5);
+            // Also compute uniform scale suggestion (largest planar extent)
+            const dExtent = dMax.clone().sub(dMin);
+            const mExtent = mMax.clone().sub(mMin);
+            const dSpan = Math.max(dExtent.x, dExtent.z);
+            const mSpan = Math.max(mExtent.x, mExtent.z);
+            let scaleSuggestion = null;
+            if (dSpan > 0 && mSpan > 0) {
+              scaleSuggestion = mSpan / dSpan;
+              // Fire event so UI can show suggestion
+              window.dispatchEvent(new CustomEvent('abacws:scale-suggestion', { detail: { scale: scaleSuggestion } }));
+            }
+            const delta = mCenter.clone().sub(dCenter);
+            this.deviceRoot.position.add(delta);
+            localStorage.setItem(cacheKey, JSON.stringify({ dx: delta.x, dy: delta.y, dz: delta.z, count: devices.length }));
+            if (window.__abacws_debug) console.log('[ALIGN] Applied auto device alignment delta', delta);
+          } else if (window.__abacws_debug) {
+            console.warn('[ALIGN] Could not compute model or device bbox for auto alignment');
+          }
+        }
+      } catch (e) { if (window.__abacws_debug) console.warn('Auto align error', e); }
+    }
+
+    // If there was a pending external focus before devices loaded, apply now
+    if (this._pendingFocus && typeof this._pendingFocus === 'string') {
+      const mesh = this.getDeviceMeshByName(this._pendingFocus);
+      if (mesh) {
+        this.devicePointerDown(mesh);
+        this.pulseHighlight(mesh);
+        this._pendingFocus = undefined;
+      }
+    }
+    // Add ambient/direction lights (once)
+    if (!this._lightAdded) {
+      const ambientLight = new THREE.AmbientLight(0x404040);
+      const light = new THREE.DirectionalLight(0xf4f4f4);
+      light.position.set(-100, 100, -100);
+      this.deviceScene.add(light, ambientLight);
+      this._lightAdded = true;
+    }
   }
 
-  attachDeviceIcon(mesh) {
-    const mat = new THREE.SpriteMaterial({ map: DEVICE_ICON_TEX, color: DEVICE_COLOR, depthTest: true, depthWrite: false, transparent: true });
-    const sprite = new THREE.Sprite(mat);
-    sprite.position.set(0, 2.8, 0);
-    sprite.scale.set(1.8, 2.2, 1);
-    sprite.userData = { kind: 'deviceIcon' };
-    sprite.renderOrder = 1;
-    mesh.add(sprite);
-    mesh.userData.deviceIconSprite = sprite;
+  // External focus helper
+  focusDeviceByName(name) {
+    const mesh = this.getDeviceMeshByName(name);
+    if (!mesh) {
+      // Defer until devices load
+      this._pendingFocus = name;
+      return;
+    }
+    this.devicePointerDown(mesh);
+    this.pulseHighlight(mesh);
+    // Center camera gently on the device
+    const target = mesh.getWorldPosition(new THREE.Vector3());
+    this.animateCameraTo(target);
+  }
+
+  animateCameraTo(target) {
+    if (!target) return;
+    // Simple lerp over ~20 frames
+    const startPos = this.camera.position.clone();
+    const startTarget = this.controls.target.clone();
+    const desiredTarget = target.clone();
+    const desiredPos = target.clone().add(new THREE.Vector3(0, 60, 80));
+    let frame = 0;
+    const max = 20;
+    const step = () => {
+      frame++;
+      const t = frame / max;
+      const ease = t*t*(3-2*t); // smoothstep
+      this.camera.position.lerpVectors(startPos, desiredPos, ease);
+      this.controls.target.lerpVectors(startTarget, desiredTarget, ease);
+      this.controls.update();
+      if (frame < max) requestAnimationFrame(step);
+    };
+    requestAnimationFrame(step);
+  }
+
+  pulseHighlight(mesh) {
+    if (!mesh || !mesh.material) return;
+    const originalEmissive = mesh.material.emissive ? mesh.material.emissive.clone() : null;
+    let frame = 0;
+    const max = 30;
+    const animate = () => {
+      frame++;
+      const phase = Math.sin((frame / max) * Math.PI);
+      if (mesh.material?.emissive) {
+        mesh.material.emissive.setHex(0x00ffaa);
+        mesh.material.emissiveIntensity = 0.25 + phase * 0.75;
+      }
+      if (frame < max) {
+        requestAnimationFrame(animate);
+      } else if (originalEmissive && mesh.material?.emissive) {
+        mesh.material.emissive.copy(originalEmissive);
+        mesh.material.emissiveIntensity = 0.25;
+      }
+    };
+    requestAnimationFrame(animate);
+  }
+
+  toggleBoundingBoxes(enabled) {
+    if (this._bboxHelpers) {
+      this._bboxHelpers.forEach(h => this.scene.remove(h));
+      this._bboxHelpers = undefined;
+    }
+    if (!enabled) return;
+    this._bboxHelpers = [];
+    try {
+      // Device cloud bbox (post-offset) using current deviceRoot children
+      const dBox = new THREE.Box3();
+      const scratch = new THREE.Box3();
+      this.deviceRoot.children.forEach(ch => {
+        scratch.setFromObject(ch);
+        dBox.union(scratch);
+      });
+      if (!dBox.isEmpty()) {
+        const helper = new THREE.Box3Helper(dBox, 0x00ffaa);
+        this.scene.add(helper);
+        this._bboxHelpers.push(helper);
+      }
+      // Model floor bbox
+      if (this._layerGroups?.floors?.children?.length) {
+        const floor = this._layerGroups.floors.children[0];
+        const mBox = new THREE.Box3().setFromObject(floor);
+        const helper2 = new THREE.Box3Helper(mBox, 0xff8800);
+        this.scene.add(helper2);
+        this._bboxHelpers.push(helper2);
+      }
+    } catch(e) { if (window.__abacws_debug) console.warn('BBox helper error', e); }
   }
 
   attachLockSprite(mesh) {
@@ -411,7 +707,7 @@ export default class Graphics {
     this.pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
     this.pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
     this.rayCaster.setFromCamera(this.pointer, this.camera);
-    const intersects = this.rayCaster.intersectObjects(this.deviceScene.children, true);
+  const intersects = this.rayCaster.intersectObjects(this.deviceRoot.children, true);
     const lockHit = intersects.find(h => h.object?.userData?.kind === 'lock');
     if (!lockHit) {
       // Not on a lock: deselect if not clicking any device; otherwise allow RMB orbit
@@ -430,6 +726,19 @@ export default class Graphics {
     if (event.key === 'Escape') {
       this.deselectDevice();
       return;
+    }
+    // Orientation helper toggles (ignore if typing in an input/textarea)
+    const activeEl = document.activeElement;
+    const typing = activeEl && (activeEl.tagName === 'INPUT' || activeEl.tagName === 'TEXTAREA' || activeEl.isContentEditable);
+    if (!typing) {
+      if (event.key.toLowerCase() === 'x') {
+        this.toggleAxes();
+        return;
+      }
+      if (event.key.toLowerCase() === 'g') {
+        this.toggleGrid();
+        return;
+      }
     }
     if (event.key.toLowerCase() === 'p') {
       const mesh = this._selectedDevice || this._hoveredDevice;
@@ -466,6 +775,69 @@ export default class Graphics {
     this.camera.aspect = this.width / this.height;
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(this.width, this.height);
+  }
+
+  // Orientation Helpers ---------------------------------------------------------------------------
+  createOrientationHelpers() {
+    // Axes helper (default visible)
+    const center = new THREE.Vector3(160, 0, -120); // matches ground/model center
+    this.axesHelper = new THREE.AxesHelper(50);
+    this.axesHelper.position.copy(center);
+    this.axesHelper.visible = this._axesVisible;
+    this.scene.add(this.axesHelper);
+
+    // Axis labels via CSS2D so they always face camera & stay legible
+    const labelStyle = 'background:rgba(0,0,0,.55);color:#fff;padding:2px 4px;font:10px system-ui;border-radius:4px;pointer-events:none;';
+    const mkLabel = (text, offset) => {
+      const el = document.createElement('div');
+      el.style.cssText = labelStyle;
+      el.textContent = text;
+      const obj = new CSS2DObject(el);
+      obj.position.copy(center.clone().add(offset));
+      obj.visible = this._axesVisible;
+      this.scene.add(obj);
+      this._axesLabels.push(obj);
+    };
+    mkLabel('X', new THREE.Vector3(55, 0, 0));
+    mkLabel('Y', new THREE.Vector3(0, 55, 0));
+    mkLabel('Z', new THREE.Vector3(0, 0, 55));
+
+    // Grid helper (XZ plane) - default hidden to avoid visual clutter
+    this.gridHelper = new THREE.GridHelper(300, 30, 0x555555, 0x333333);
+    this.gridHelper.position.copy(center);
+    // GridHelper is centered at origin; keep y slightly above 0 for contrast with ground plane
+    this.gridHelper.position.y = 0.6;
+    this.gridHelper.visible = this._gridVisible;
+    this.scene.add(this.gridHelper);
+
+    this.showOrientationHintOnce();
+  }
+
+  toggleAxes(force) {
+    if (!this.axesHelper) return;
+    this._axesVisible = (typeof force === 'boolean') ? force : !this._axesVisible;
+    this.axesHelper.visible = this._axesVisible;
+    for (const l of this._axesLabels) l.visible = this._axesVisible;
+  }
+
+  toggleGrid(force) {
+    if (!this.gridHelper) return;
+    this._gridVisible = (typeof force === 'boolean') ? force : !this._gridVisible;
+    this.gridHelper.visible = this._gridVisible;
+  }
+
+  showOrientationHintOnce() {
+    try {
+      if (typeof localStorage !== 'undefined') {
+        if (localStorage.getItem('__abacws_orient_hint_shown')) return;
+        localStorage.setItem('__abacws_orient_hint_shown', '1');
+      }
+      const el = document.createElement('div');
+      el.style.cssText = 'position:fixed;left:12px;bottom:12px;z-index:9998;background:rgba(0,0,0,.55);color:#fff;padding:6px 10px;font:11px system-ui;border-radius:6px;backdrop-filter:blur(4px);max-width:240px;line-height:1.4;';
+      el.innerHTML = `<strong>Orientation</strong><br/>Press <b>X</b> to toggle axes, <b>G</b> to toggle grid.<br/>Force legacy offset: <code>${!!FORCE_LEGACY_OFFSET}</code>`;
+      document.body.appendChild(el);
+      setTimeout(() => { try { el.remove(); } catch(_){} }, 7000);
+    } catch(_){}
   }
 
   pointerMove(event) {
@@ -538,7 +910,7 @@ export default class Graphics {
       this.pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
       this.pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
       this.rayCaster.setFromCamera(this.pointer, this.camera);
-      const allHits = this.rayCaster.intersectObjects(this.deviceScene.children, true);
+  const allHits = this.rayCaster.intersectObjects(this.deviceRoot.children, true);
       if (allHits.length) {
         const lockHit = allHits.find(h => h.object?.userData?.kind === 'lock');
         if (lockHit) {
@@ -558,12 +930,25 @@ export default class Graphics {
       this.pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
       this.pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
       this.rayCaster.setFromCamera(this.pointer, this.camera);
-      const hits = this.rayCaster.intersectObjects(this.deviceScene.children, true);
+  const hits = this.rayCaster.intersectObjects(this.deviceRoot.children, true);
       // If clicking the transform gizmo, let it handle the interaction (do not deselect)
       const gizmoHit = this.rayCaster.intersectObject(this.transform, true).length > 0;
       let obj = hits?.[0]?.object;
       while (obj && !obj.userData?.name && obj.parent) obj = obj.parent;
       if (!obj || !obj.userData?.name) {
+        // If pick mode is active, allow picking ground coordinate for creation
+        if (window.__ABACWS_PICK_POSITION__) {
+          // Raycast to ground mesh
+          this.rayCaster.setFromCamera(this.pointer, this.camera);
+          if (this.ground) {
+            const gHits = this.rayCaster.intersectObject(this.ground, false);
+            if (gHits.length) {
+              const p = gHits[0].point;
+              try { window.dispatchEvent(new CustomEvent('abacws:pick-position', { detail:{ x:p.x, y:70, z:p.z } })); } catch(_){}
+            }
+          }
+          return;
+        }
         if (!gizmoHit) this.deselectDevice();
         return; // clicked empty space or gizmo
       }
@@ -681,7 +1066,7 @@ export default class Graphics {
     this.pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
     this.pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
     this.rayCaster.setFromCamera(this.pointer, this.camera);
-    const hitObjs = this.rayCaster.intersectObjects(this.deviceScene.children, true);
+  const hitObjs = this.rayCaster.intersectObjects(this.deviceRoot.children, true);
     if (hitObjs.length) {
       let obj = hitObjs[0].object;
       while (obj && !obj.userData?.name && obj.parent) obj = obj.parent;
@@ -690,8 +1075,8 @@ export default class Graphics {
         return;
       }
     }
-    // Otherwise, double-click on empty ground -> create a device
-    // Build a ground picking plane at y=70 (roughly the device y in sample data)
+  // Otherwise, double-click on empty ground -> request create modal
+  // Build a ground picking plane at y=70 (roughly the device y in sample data)
     this.pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
     this.pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
     this.rayCaster.setFromCamera(this.pointer, this.camera);
@@ -707,62 +1092,31 @@ export default class Graphics {
 
     // Snap to integers for neatness
     const position = { x: Math.round(point.x), y: 70, z: Math.round(point.z) };
-
-    // Prompt minimal details; can be replaced with a proper modal later
-    const name = window.prompt('Device name (unique):');
-    if (!name) return;
-    const type = window.prompt('Device type (e.g., corridor, teaching_space):') || 'generic';
-    const floorStr = window.prompt('Floor number (e.g., 5):', '5');
-    const floor = Number(floorStr);
-    if (Number.isNaN(floor)) return alert('Invalid floor');
-
-    try {
-      const res = await apiFetch('/api/devices', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, type, floor, position }),
-      });
-      if (!res.ok) {
-        const msg = res.body?.error || 'Failed to create device';
-        return alert(msg);
-      }
-      // Refresh devices from API and re-render
-      const devices = (await apiFetch('/api/devices')).body;
-      this.setDevices(devices);
-      // Optionally select the newly created device
-      const created = res.body;
-      const mesh = this.deviceScene.children.find((c) => c.userData?.name === created?.name);
-      if (mesh) this.devicePointerDown(mesh);
-    } catch (e) {
-      // eslint-disable-next-line no-alert
-      alert('Error creating device');
-      // eslint-disable-next-line no-console
-      console.error(e);
-    }
+    try { window.dispatchEvent(new CustomEvent('abacws:device-create-request', { detail: { position } })); } catch(_) {}
   }
 
   deviceHoverEnter(device) {
     this._hoveredDevice = device;
     if (device === this._selectedDevice) return;
-    if (device.userData?.deviceIconSprite) device.userData.deviceIconSprite.material.color.set(DEVICE_HOVER_COLOR);
+    if (device.material?.color) device.material.color.set(DEVICE_HOVER_COLOR);
   }
 
   deviceHoverExit(device) {
     this._hoveredDevice = undefined;
     if (device === this._selectedDevice) return;
-    if (device.userData?.deviceIconSprite) device.userData.deviceIconSprite.material.color.set(DEVICE_COLOR);
+    if (device.material?.color) device.material.color.set(DEVICE_COLOR);
   }
 
   devicePointerDown(device) {
     if (device !== this._selectedDevice && this._selectedDevice) {
       const selectedDevice = this._selectedDevice;
       // Reset previous selection icon color
-  if (selectedDevice.userData?.deviceIconSprite) selectedDevice.userData.deviceIconSprite.material.color.set(DEVICE_COLOR);
+      if (selectedDevice.material?.color) selectedDevice.material.color.set(DEVICE_COLOR);
     }
     this._selectedDevice = device;
     if (device) {
       // Highlight via icon sprite color
-      if (device.userData?.deviceIconSprite) device.userData.deviceIconSprite.material.color.set(DEVICE_SELECTED_COLOR);
+      if (device.material?.color) device.material.color.set(DEVICE_SELECTED_COLOR);
       // Attach transform controls only when CTRL is pressed and not pinned
       if (!device.userData?.pinned) {
         if (this._ctrlPressed || this._activeMove) {
@@ -789,7 +1143,7 @@ export default class Graphics {
   // Public helpers for external UI
   getDeviceMeshByName(name) {
     if (!name) return undefined;
-    for (const child of this.deviceScene.children) {
+    for (const child of this.deviceRoot.children) {
       if (child?.userData?.name === name) return child;
     }
     return undefined;

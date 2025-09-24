@@ -1,4 +1,5 @@
 import { useAPI, useAPISubscription } from "./useAPI";
+import { useTimeContext } from './useTimeContext';
 
 export function useDevices() {
   return useAPI("/api/devices")?.body;
@@ -15,8 +16,10 @@ export function useDeviceData(deviceName) {
 }
 
 export function useDeviceHistory(deviceName) {
-  const to = Math.round(Date.now()/20000)*20000;
-  const from = to - (12*60*60*1000);
+  const time = useTimeContext();
+  const to = time?.to || Date.now();
+  const from = time?.from || (to - 12*60*60*1000);
   const url = deviceName ? `/api/devices/${deviceName}/history?to=${to}&from=${from}` : undefined;
+  // Poll faster in live mode by temporarily reducing subscription interval logic (reuse existing hook semantics if it honors URL changes)
   return useAPISubscription(url)?.body;
 }

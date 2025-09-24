@@ -1,4 +1,4 @@
-const client = require('../database');
+const store = require('../datastore');
 
 // Resolve :deviceName param to a device document and stash on res.locals
 async function deviceMiddleware(req, res, next) {
@@ -6,10 +6,7 @@ async function deviceMiddleware(req, res, next) {
     const deviceName = req.params.deviceName;
     if (!deviceName) return res.status(400).json({ error: 'Missing deviceName' });
 
-    const device = await client
-      .db()
-      .collection('devices')
-      .findOne({ name: deviceName }, { projection: { _id: 0 } });
+    const device = await store.getDeviceByName(deviceName);
 
     if (!device) return res.status(404).json({ error: 'Device not found' });
     res.locals.device = device;

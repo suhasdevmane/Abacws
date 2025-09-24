@@ -1,7 +1,7 @@
 const cors = require('cors');
 const express = require('express');
 const { consoleLogErrors, errorHandler, mongodbLogErrors } = require('./middleware');
-const { devices, docs, healthcheck, query } = require('./routers');
+const { devices, docs, healthcheck, query, admin, datasources, mappings, latest, rules, stream } = require('./routers');
 
 /** Express app */
 const api = express();
@@ -9,13 +9,19 @@ const api = express();
 api.use(cors());
 api.use(express.json());
 
-// Lightweight process health (no external deps)
-api.get('/health', (_req, res) => res.status(200).json({ status: 'ok' }));
+// Health now handled at top-level app (/health & /health/db). Keep optional legacy route.
+api.get('/health', (_req, res) => res.status(200).json({ status: 'ok', note: 'See top-level /health for db status' }));
 
 // Register routes
 api.use("/healthcheck", healthcheck);
 api.use("/query", query);
 api.use("/devices", devices);
+api.use("/admin", admin);
+api.use("/datasources", datasources);
+api.use("/mappings", mappings);
+api.use("/latest", latest);
+api.use('/rules', rules);
+api.use('/stream', stream);
 
 // Register error handlers
 api.use(mongodbLogErrors);

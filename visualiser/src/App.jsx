@@ -1,9 +1,9 @@
 import './App.scss';
 import { ModelView, DataView } from './views/index.js';
 import { useEffect, useState } from 'react';
-import { HamburgerToggle } from './components/index.js';
+import { HamburgerToggle, HealthStatus, DeviceDrawer, AdjustDevicesPanel, SettingsPanel } from './components/index.js';
 import { DeviceSelectEvent, useSelectedDevice } from './three/index.js';
-import { useDeviceInfo } from './hooks/index.js';
+import { useDeviceInfo, TimeProvider } from './hooks/index.js';
 
 export default function App() {
   const [hideDataView, setHideDataView] = useState(window.innerWidth < 500);
@@ -19,10 +19,16 @@ export default function App() {
   }, []);
 
   return (
-    <div className="app">
-      <ModelView />
-      <HamburgerToggle onClick={() => { setHideDataView(!hideDataView); }} close={!hideDataView} />
-      <DataView hidden={hideDataView} />
-    </div>
+    <TimeProvider>
+      <div className="app">
+        <AdjustDevicesPanel />
+        <HealthStatus />
+        <ModelView />
+        <HamburgerToggle onClick={() => { setHideDataView(!hideDataView); }} close={!hideDataView} />
+        <DataView hidden={hideDataView} />
+        <SettingsPanel />
+        {selectedDeviceName && <DeviceDrawer onClose={() => { window.dispatchEvent(new CustomEvent(DeviceSelectEvent.TYPE,{ detail:{ deviceName: null } })); }} />}
+      </div>
+    </TimeProvider>
   );
 }
