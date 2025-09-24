@@ -22,8 +22,9 @@
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^4.17.2",
-  "mongodb": "^4.4.0",
-  "pg": "^8.11.5",
+    "mongodb": "^4.4.0",
+    "pg": "^8.11.5",
+    "mysql2": "^3.9.7",
     "swagger-ui-express": "^4.3.0",
     "yaml": "^2.0.0-11"
   }

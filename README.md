@@ -10,10 +10,10 @@ Abacws is a two‑part platform:
 
 | Component | Purpose |
 |-----------|---------|
-| API (Node.js/Express) | Device registry, latest + historical data, querying, rules, external timeseries mappings (PostgreSQL / MongoDB) |
+| API (Node.js/Express) | Device registry, latest + historical data, querying, rules, external timeseries mappings (PostgreSQL / MySQL / MongoDB) |
 | Visualiser (React + three.js) | Interactive 3D building viewer: add / move / pin devices, inspect data, align coordinate systems, debug spatial issues |
 
-Runs locally with Docker Compose. Production: place behind a reverse proxy (Traefik / Nginx). Minimal environment configuration flips storage between MongoDB and PostgreSQL without client changes.
+Runs locally with Docker Compose. Production: place behind a reverse proxy (Traefik / Nginx). Minimal environment configuration flips storage between MongoDB, PostgreSQL, and MySQL without client changes.
 
 ---
 
@@ -23,7 +23,7 @@ Runs locally with Docker Compose. Production: place behind a reverse proxy (Trae
 2. [Architecture Overview](#architecture-overview)
 3. [Key Features](#key-features)
 4. [Repository Layout](#repository-layout)
-5. [Configuring Datastores (MongoDB / PostgreSQL)](#configuring-datastores)
+5. [Configuring Datastores (MongoDB / PostgreSQL / MySQL)](#configuring-datastores)
 6. [Visualiser Usage Guide](#visualiser-usage-guide)
 7. [Coordinate Alignment & Migration](#coordinate-alignment--migration)
 8. [External Time‑Series Mappings (Experimental)](#external-time-series-mappings-experimental)
@@ -170,17 +170,32 @@ You can switch storage with a single environment variable: `DB_ENGINE`.
 | Value | Engine | Notes |
 |-------|--------|-------|
 | `mongo` (default) | MongoDB | Device history collections per device |
-| `postgres` | PostgreSQL  | Unified tables (`devices`, `device_data`) |
+| `postgres` | PostgreSQL  | Unified tables (`devices`, `device_data`, + advanced mappings & rules) |
+| `mysql` | MySQL 8+ | Parity with Postgres feature set (JSON columns, mappings, rules) |
 | `disabled` | In‑memory   | Read‑only (returns 503 for mutating data endpoints) |
 
-Minimal change to use PostgreSQL (already included in compose):
-1. Set env: `DB_ENGINE=postgres` (compose file or shell export).
+Minimal change to use PostgreSQL or MySQL (both included in compose):
+1. Set env: `DB_ENGINE=postgres` or `DB_ENGINE=mysql` (compose file or shell export).
 2. Rebuild: `docker compose up -d --build`.
 3. API auto creates tables if absent.
 
 No front‑end changes required. JSON shapes are consistent across engines.
 
 To revert: change to `mongo` and rebuild.
+
+### When to choose which engine
+
+| Scenario | Recommended Engine | Reason |
+|----------|--------------------|--------|
+| Quick local prototyping | `mongo` | Zero config, per‑device collections simple to inspect |
+| Time‑series mappings + rules @ scale | `postgres` | Mature window functions & indexing strategy already tuned |
+| MySQL ecosystem / existing infra | `mysql` | Full parity with Postgres features using JSON + window functions |
+
+Performance characteristics:
+* Postgres & MySQL use a single `device_data` table with composite index for fast latest + bounded history queries.
+* Mongo uses one capped-like pattern per device (separate collection) — simple horizontal separation.
+* External mappings and rules are available for both Postgres and MySQL; Mongo mode skips those tables.
+* MySQL service port is not exposed by default in compose to avoid host port conflicts (e.g. an existing local MySQL on 3306). Uncomment and map to an alternate host port if you need direct CLI access (e.g. `3307:3306`).
 
 ---
 
@@ -293,33 +308,35 @@ Key endpoints (see full `api/openapi.yaml`):
 - GET /query/history — filter devices and their history
 
 Persistence engines:
-- Default: MongoDB (container `abacws-mongo`). Historical data per device is stored in per-device collections.
-- Optional: PostgreSQL (container `abacws-postgres`). Enable by setting `DB_ENGINE=postgres` (env or compose). Tables:
-  - `devices(name PRIMARY KEY, type, floor, pos_x, pos_y, pos_z, pinned, created_at, updated_at)`
-  - `device_data(id bigserial PK, device_name FK→devices, timestamp bigint, payload jsonb)`
-  - Index on `(device_name, timestamp DESC)` for fast latest + history queries.
-- Offline / Disabled: `DB_ENGINE=disabled` will serve devices from `devices.json` and keep transient in‑memory history only (no persistence).
+* MongoDB (container `abacws-mongo`). Historical data per device is stored in per-device collections.
+* PostgreSQL (container `abacws-postgres`). Tables:
+  * `devices(name PRIMARY KEY, type, floor, pos_x, pos_y, pos_z, pinned, created_at, updated_at)`
+  * `device_data(id bigserial PK, device_name FK→devices, timestamp bigint, payload jsonb)`
+  * `data_sources`, `device_timeseries_mappings`, `device_rules` (advanced features)
+* MySQL (container `abacws-mysql`). Schema mirrors Postgres using appropriate MySQL types (DOUBLE, JSON, ENUM). Uses window functions (MySQL 8+) for batch latest mapping aggregation.
+* Disabled: `DB_ENGINE=disabled` serves devices from `devices.json` and keeps transient in‑memory history only (no persistence, write endpoints 503).
 
 Runtime switching:
 ```
 DB_ENGINE=postgres docker compose up -d --build
+DB_ENGINE=mysql docker compose up -d --build
 ```
 Or edit the `api` service environment in `docker-compose.yml`.
 
 Data parity:
-- Both engines expose identical JSON shapes to the visualiser/API clients.
-- `devices.json` remains a convenience mirror and is updated on creates/updates in either mode.
+* All three engines expose identical JSON shapes to clients.
+* `devices.json` remains a convenience mirror and is updated on creates/updates in any persistent mode.
 
-Migration from Mongo to Postgres:
-1. Start Mongo mode and ensure devices exist.
-2. Start Postgres mode (DB_ENGINE=postgres). If you need to seed, write a one-off script to read `devices.json` and insert rows (future helper can be added).
-3. Historical data is not auto-migrated (per-collection → single table). A migration script would iterate device collections and bulk insert into `device_data`.
+Migration examples:
+* Mongo → Postgres/MySQL: iterate each device collection and bulk insert into target `device_data` table (script not yet included).
+* Postgres ↔ MySQL: dump / restore (schema is analogous; adjust auto‑increment & enum differences). JSON payloads portable.
 
 Notes:
-- Unique device name enforcement: Mongo index vs Postgres primary key constraint (offline checks duplicate in memory).
-- Latest data lookup: Mongo sort/findOne vs Postgres ORDER BY LIMIT 1 vs offline last array entry.
-- History limits: capped at 10k records per request (configurable in code).
-- Disabled mode returns HTTP 503 for write/data endpoints (create device, add data, update, history write) while still allowing GET /devices.
+* Unique device name enforcement: Mongo index vs Postgres/MySQL primary key.
+* Latest data lookup: Mongo sort/findOne vs Postgres/MySQL ORDER BY + LIMIT 1.
+* History limits: capped at 10k per request (configurable).
+* Disabled mode returns HTTP 503 for mutating endpoints while still allowing GET /devices.
+* MySQL requires version 8+ (window functions used for mapping aggregation); earlier versions unsupported.
 
 ### External Time‑Series Mappings (Experimental)
 
@@ -370,7 +387,7 @@ Security & Credentials:
 - Future: separate pool per data source; currently assumes same DB for simplicity.
 
 Limitations / Roadmap:
-- Only single Postgres engine currently; no cross-database host connections yet.
+-- Only Postgres/MySQL engines implement external mappings & rules (Mongo omitted by design).
 - No aggregation (avg, min/max) or resampling—client fetches raw rows up to a limit (default 2000).
 - No transformation expressions; consider adding computed columns or views server-side.
 - Manual reload after save; planned improvement: in-memory cache invalidation and hook refresh.

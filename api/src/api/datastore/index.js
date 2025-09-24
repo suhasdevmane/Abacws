@@ -7,6 +7,8 @@ function select() {
 	switch (DB_ENGINE) {
 		case 'postgres':
 			return require('./postgres');
+		case 'mysql':
+			return require('./mysql');
 		case 'disabled':
 		case 'off':
 		case 'none':
