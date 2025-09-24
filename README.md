@@ -1,35 +1,132 @@
-# Abacws — API + 3D Visualiser
+<div align="center">
 
-Abacws is a two-part system for exploring IoT devices in a building model:
-- API: a Node.js/Express service backed by MongoDB for devices, data, history, and a simple query layer. Ships with Swagger UI.
-- Visualiser: a React + three.js web app that renders your building GLB layers and lets you add, move, and pin devices directly in 3D.
+# Abacws — Spatial IoT API + 3D Visualiser
 
-Both services run locally with Docker Compose and can be deployed behind a reverse proxy (Traefik, nginx, etc.).
+Rich spatial exploration & live telemetry for building / campus devices.
 
----
+</div>
 
-## Features at a glance
+Abacws is a two‑part platform:
 
-- Replaceable 3D building model (GLB/GLTF) via a simple manifest file
-- Device CRUD via API or directly from the visualiser (double-click to add)
-- Interactive device editing
-  - Select device icon to open a floating HUD with actions: Lock/Unlock, ↕ Move (Y), ↔ Move (XZ)
-  - Move devices with TransformControls; live PATCHs during move and final save on release
-  - Auto-unlock before move and auto-lock after when using HUD actions
-  - Pin/unpin from lock sprite, HUD, or keyboard (P)
-- Better visibility & interaction
-  - Device icon and lock are sprites that occlude behind geometry and scale with zoom
-  - Larger invisible pick proxy to make selection easier
-  - Hover and selection color cues; robust click targeting
-- Smooth navigation
-  - Mouse wheel zoom and RMB orbit always work (HUD doesn’t steal events)
-  - Click-away deselection: click empty space or use the ✕ button or Escape to close the HUD
-- API docs via Swagger UI
- - Coordinate alignment & debug tools (auto align, scale suggestion, bbox overlay, migration script)
+| Component | Purpose |
+|-----------|---------|
+| API (Node.js/Express) | Device registry, latest + historical data, querying, rules, external timeseries mappings (PostgreSQL / MongoDB) |
+| Visualiser (React + three.js) | Interactive 3D building viewer: add / move / pin devices, inspect data, align coordinate systems, debug spatial issues |
+
+Runs locally with Docker Compose. Production: place behind a reverse proxy (Traefik / Nginx). Minimal environment configuration flips storage between MongoDB and PostgreSQL without client changes.
 
 ---
 
-## Repo layout
+## Table of Contents
+
+1. [Quick Start](#quick-start)
+2. [Architecture Overview](#architecture-overview)
+3. [Key Features](#key-features)
+4. [Repository Layout](#repository-layout)
+5. [Configuring Datastores (MongoDB / PostgreSQL)](#configuring-datastores)
+6. [Visualiser Usage Guide](#visualiser-usage-guide)
+7. [Coordinate Alignment & Migration](#coordinate-alignment--migration)
+8. [External Time‑Series Mappings (Experimental)](#external-time-series-mappings-experimental)
+9. [Device Adjustment & Highlighting Workflow](#device-adjustment--highlighting-workflow)
+10. [Scripts & Utilities](#scripts--utilities)
+11. [Environment Variables Reference](#environment-variables-reference)
+12. [Troubleshooting](#troubleshooting)
+13. [Development (Local & Docker)](#development)
+14. [Deployment Notes](#deployment-notes)
+15. [License](#license)
+
+---
+
+## Quick Start
+
+```pwsh
+# From repo root
+docker compose down -v
+docker compose up -d --build
+```
+
+Open:
+- Visualiser: http://localhost:8090/
+- API health: http://localhost:5000/health  → `{ "status":"ok" }`
+- Swagger UI: http://localhost:5000/api/
+
+Switch to PostgreSQL (hot re‑provision):
+```pwsh
+docker compose down
+setx DB_ENGINE postgres   # or edit docker-compose.yml env for api
+docker compose up -d --build
+```
+> On Linux/macOS just export DB_ENGINE=postgres before `docker compose up`.
+
+---
+
+## Architecture Overview
+
+```
+┌──────────┐   REST / JSON   ┌──────────────────────┐
+│ Visualiser│ ─────────────▶ │ API (Express)        │
+│ (React +  │ ◀───────────── │ /api/... endpoints   │
+│ three.js) │  WebSocket/SSE │ (Devices, Query,     │
+└─────┬────┘   (future)      │  History, Latest,    │
+  │                      │  Mappings, Rules)    │
+  │                      └─────────┬────────────┘
+  │                                 │
+  │                                 │ Storage abstraction
+  │                                 ▼
+  │                     ┌─────────────────────┐
+  │                     │ MongoDB OR PostgreSQL│
+  │                     └─────────────────────┘
+  │
+  │ (Static GLB layers)
+  ▼
+ Building Model (GLB assets)
+```
+
+Datastore engines share a common interface so front‑end code never changes when switching.
+
+---
+
+## Key Features
+
+### Spatial & Editing
+* Replaceable building model (multi‑layer GLB manifest)
+* Double‑click add device (name, type, floor)
+* Live device movement with axis constraints & auto lock/unlock
+* Lock / Pin management via sprite, HUD, or keyboard (P)
+* Device highlight: selecting from list auto focuses camera, pulses emissive color, shows HUD
+
+### Data & Telemetry
+* Latest device data retrieval (storage agnostic)
+* Historical queries / range filtering
+* External time‑series mappings (Postgres table → virtual device feed) – experimental
+
+### Coordinate System & Alignment
+* Legacy offset support (force or heuristic)
+* Auto center alignment (device cloud ↔ model floor)
+* Scale factor suggestion (non‑destructive)
+* Bounding box visual debug overlay
+* Migration script to bake translation and optional scale
+
+### UX & Debug Aids
+* Orientation helpers (axes/grid toggles via X / G)
+* Adjustable devices side panel with search-ready structure
+* Floating settings panel (⚙) for alignment & debug toggles
+* FPS / stats overlay (top-right, non‑blocking)
+
+### API / Backend
+* Pluggable datastore (MongoDB or PostgreSQL) via one env var
+* Structured query endpoints & batch latest
+* Rules and (optional) future SSE streaming foundation
+* Admin DB disable/enable endpoints
+
+### Tooling & Scripts
+* Coordinate migration (scale + translation)
+* Device bulk export/import (see routers/devicesBulk)
+* Telemetry demo script (`demo.py`) for rapid live testing
+
+---
+
+## Repository Layout
 
 ```
 .
@@ -66,39 +163,28 @@ Both services run locally with Docker Compose and can be deployed behind a rever
 
 ---
 
-## Quickstart (Docker)
+## Configuring Datastores
 
-Prerequisites: Docker Desktop (or engine) and a terminal (PowerShell on Windows).
+You can switch storage with a single environment variable: `DB_ENGINE`.
 
-1) Build and start all services
+| Value | Engine | Notes |
+|-------|--------|-------|
+| `mongo` (default) | MongoDB | Device history collections per device |
+| `postgres` | PostgreSQL  | Unified tables (`devices`, `device_data`) |
+| `disabled` | In‑memory   | Read‑only (returns 503 for mutating data endpoints) |
 
-```pwsh
-# from repo root
-docker compose down -v
-docker compose up -d --build
-```
+Minimal change to use PostgreSQL (already included in compose):
+1. Set env: `DB_ENGINE=postgres` (compose file or shell export).
+2. Rebuild: `docker compose up -d --build`.
+3. API auto creates tables if absent.
 
-2) Open the apps
-- Visualiser: http://localhost:8090/
-- API health: http://localhost:5000/health → {"status":"ok"}
-- API docs (Swagger UI): http://localhost:5000/api/
+No front‑end changes required. JSON shapes are consistent across engines.
 
-3) Troubleshooting
-- Visualiser is blank:
-  - Check DevTools → Console/Network for 404s from /assets/* or /api/*.
-  - Ensure visualiser/public/assets/manifest.json exists and references valid GLB filenames in public/assets.
-  - If the GLBs look ~130 bytes, you likely have Git LFS pointers. Pull the real files:
-    ```
-    git lfs install
-    git lfs pull
-    ```
-- API unreachable:
-  - Confirm container is healthy: `docker ps` and check abacws-api logs.
-  - The API exposes port 5000; the visualiser proxies to it in dev and NGINX proxies in prod.
+To revert: change to `mongo` and rebuild.
 
 ---
 
-## Using the 3D visualiser
+## Visualiser Usage Guide
 
 - Add a device: double-click on the floor to create a device at that spot; you’ll be prompted for name, type, and floor.
 - Select a device: click its icon. A floating HUD shows the name and actions.
@@ -107,7 +193,14 @@ docker compose up -d --build
 - Deselect: click empty space, click the ✕ in the HUD, or press Escape.
 - Camera: mouse wheel to zoom; right mouse button to orbit.
 
-Occlusion & scaling: the device icon and lock are rendered as sprites that scale with distance and disappear behind geometry naturally.
+Occlusion & scaling: device icon & lock are sprites that scale with distance and occlude naturally behind geometry.
+
+### Device Adjustment & Highlighting Workflow
+* Open Adjust Devices panel (bottom-left handle) – lists all devices.
+* Click a device in the list → scene auto focuses, mesh pulses, HUD appears.
+* Edit X / Y / Z fields – live updates mesh before saving.
+* Save or Cancel changes (cancel reverts to original position this session).
+* Panel state can be toggled without losing drafts until save.
 
 ### Coordinate Alignment & Debug Tools
 
@@ -133,10 +226,10 @@ Settings Panel (⚙ top‑right) lets you:
 
 Scale Suggestion: Only calculated; NOT auto-applied. Use migration script if you want to bake scale + translation.
 
-Migration Script (with scale):
+Migration Script (with scale + translation):
 ```
-node visualiser/scripts/migrateDeviceCoords.js devices.json > devices-aligned.json \
-  ALIGN_DELTA="dx,dy,dz" SCALE_FACTOR=1.234
+ALIGN_DELTA="dx,dy,dz" SCALE_FACTOR=1.234 \
+  node visualiser/scripts/migrateDeviceCoords.js devices.json > devices-aligned.json
 ```
 
 If you previously relied on auto alignment, grab cached delta from:
@@ -155,7 +248,7 @@ You will see `[ALIGN]` and scale suggestion events in console.
 
 ---
 
-## Swapping the building model (GLB)
+## Swapping / Managing the Building Model (GLB)
 
 - Put your GLB files in `visualiser/public/assets/`.
 - Edit `visualiser/public/assets/manifest.json` to list layer filenames in load order, for example:
@@ -181,7 +274,7 @@ git lfs pull
 
 ---
 
-## API overview
+## API Overview
 
 - Base URL (local): http://localhost:5000/api
 - Swagger UI: http://localhost:5000/api/
@@ -228,7 +321,7 @@ Notes:
 - History limits: capped at 10k records per request (configurable in code).
 - Disabled mode returns HTTP 503 for write/data endpoints (create device, add data, update, history write) while still allowing GET /devices.
 
-### External Postgres Time‑Series (Experimental)
+### External Time‑Series Mappings (Experimental)
 
 You can map existing tables in the same Postgres cluster (e.g. a large time‑series fact table) to Abacws devices without ingesting or duplicating data.
 
@@ -304,7 +397,66 @@ UI: The visualiser shows a small status panel (top-left) with API status, DB eng
 
 ---
 
-## Local development
+## Scripts & Utilities
+
+| Script | Location | Purpose |
+|--------|----------|---------|
+| `migrateDeviceCoords.js` | `visualiser/scripts/` | Bake alignment (translation + optional scale) into device JSON |
+| `check-assets.js` | `visualiser/scripts/` | Validate presence / size of GLB assets (avoid LFS pointer issues) |
+| `demo.py` | project root | Continuously sends dummy telemetry to a device (default `node_5.20`) |
+
+### demo.py Quick Use
+```
+pip install requests
+python demo.py             # Sends every 5s
+INTERVAL_SEC=2 python demo.py
+```
+Inspect latest device data via: `GET /api/devices/node_5.20/data`.
+
+## Environment Variables Reference
+
+### API / Backend
+| Variable | Purpose | Default |
+|----------|---------|---------|
+| `DB_ENGINE` | `mongo` / `postgres` / `disabled` | `mongo` |
+| `API_KEY` | Protect admin & (optionally) write ops | none |
+| `PORT` | API listen port | 5000 |
+
+### Visualiser (Vite build or runtime window overrides)
+| Variable | Purpose |
+|----------|---------|
+| `VITE_FORCE_LEGACY_OFFSET` | Force legacy translation (160,0,-120) |
+| `VITE_COORDS_NORMALIZED` | Assert coordinates already normalized |
+| `VITE_AUTO_ALIGN_DEVICES` | Enable center alignment pass |
+| `VITE_SHOW_FPS` (future) | Force show stats overlay |
+
+Runtime (before bundle loads) equivalents: `window.__ABACWS_FORCE_LEGACY_OFFSET__`, `__ABACWS_COORDS_NORMALIZED__`, `__ABACWS_AUTO_ALIGN__`.
+
+### External Mapping (future expansion)
+| Variable | Purpose |
+|----------|---------|
+| `X_API_KEY` | Provided via `x-api-key` header for write operations | 
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Blank visualiser | Missing /assets GLBs or 404 to API | Check Network tab; pull LFS assets (`git lfs pull`) |
+| GLB files ~130 bytes | Git LFS pointer files | Run `git lfs install && git lfs pull` |
+| Devices misaligned | Legacy offset or origin mismatch | Use Settings (⚙) → Auto Align + bounding boxes; migrate when stable |
+| No latest data updates | Polling disabled or datastore offline | Check API `/health`; ensure not `DB_ENGINE=disabled` |
+| 503 errors on writes | Forced disabled via admin | POST `/api/admin/db/enable` with API key |
+| Device create 409 | Duplicate name | Choose unique name or delete existing device |
+| Postgres slow latest queries | Missing index | Ensure `(device_name, timestamp DESC)` index exists (auto created) |
+| Mapping not returning data | Wrong identifier value / column case | Verify table + column names with `/datasources/{id}/columns` |
+
+Enable debug logs in visualiser console:
+```
+localStorage.setItem('__abacws_debug','1'); location.reload();
+```
+Look for `[ALIGN]`, selection, and mapping batching logs.
+
+## Development
 
 Without Docker (optional):
 - API: `cd api && npm install && npm run dev` (listens on 5000)
@@ -315,7 +467,7 @@ With Docker:
 
 ---
 
-## Deployment notes
+## Deployment Notes
 
 - Reverse proxy (Traefik labels included in docker-compose.yml by default). Nginx/Apache are fine too.
 - Visualiser container serves the production build (NGINX) on port 80; compose maps it to 8090 locally.
